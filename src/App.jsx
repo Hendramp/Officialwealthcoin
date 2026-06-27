@@ -4,7 +4,12 @@ import { ethers } from 'ethers';
 const CONTRACT_ADDRESS = '0x394b57F4a40ff31530d66f904e1Db2C6516c018F';
 const TARGET_CHAIN_ID = 137;
 const CHAIN_HEX = '0x89';
-const POLYGON_RPC_URL = 'https://polygon-rpc.com/';
+const POLYGON_RPC_URLS = [
+  'https://polygon-rpc.com/',
+  'https://rpc-mainnet.matic.quiknode.pro/',
+  'https://rpc.ankr.com/polygon',
+];
+const POLYGON_RPC_URL = POLYGON_RPC_URLS[0];
 const WALLETCONNECT_PROJECT_ID = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID || '';
 
 const CONTRACT_ABI = [
@@ -35,8 +40,15 @@ function shortAddr(addr) {
   return addr ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : '';
 }
 function fmt(val, dec = 18, digits = 2) {
-  try { return Number(ethers.formatUnits(val, dec)).toLocaleString(undefined, { maximumFractionDigits: digits }); }
-  catch { return '0'; }
+  try {
+    const s = ethers.formatUnits(val, dec); // e.g. "1000000000.0"
+    const [intPart, fracPart = ''] = s.split('.');
+    // Format the integer part with locale commas
+    const intFormatted = BigInt(intPart).toLocaleString();
+    // Trim fractional digits
+    const frac = fracPart.slice(0, digits).replace(/0+$/, '');
+    return frac ? `${intFormatted}.${frac}` : intFormatted;
+  } catch { return '0'; }
 }
 
 // ── SVG Icons ─────────────────────────────────────────────────────────────────
@@ -1107,38 +1119,47 @@ export default function App() {
   }, []);
 
   const loadContractData = useCallback(async (addr) => {
-    try {
-      // Always use a direct RPC provider for reads — never the wallet provider.
-      // WalletConnect routes eth_call through its relay which is slow and can
-      // return stale/zero data. The JsonRpcProvider hits Polygon directly.
-      const provider = new ethers.JsonRpcProvider(POLYGON_RPC_URL);
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
+    // Try each RPC in order until one succeeds
+    let lastError;
+    for (const rpcUrl of POLYGON_RPC_URLS) {
+      try {
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
 
-      const queries = [
-        contract.totalSupply(),
-        contract.tokensPerMatic(),
-        addr ? contract.balanceOf(addr) : Promise.resolve(0n),
-        addr ? contract.stakedBalance(addr) : Promise.resolve(0n),
-        addr ? contract.pendingRewards(addr) : Promise.resolve(0n),
-        contract.totalStaked(),
-        addr ? provider.getBalance(addr) : Promise.resolve(0n),
-      ];
-      if (addr) queries.push(contract.allowance(addr, CONTRACT_ADDRESS));
+        const queries = [
+          contract.totalSupply(),
+          contract.tokensPerMatic(),
+          addr ? contract.balanceOf(addr) : Promise.resolve(0n),
+          addr ? contract.stakedBalance(addr) : Promise.resolve(0n),
+          addr ? contract.pendingRewards(addr) : Promise.resolve(0n),
+          contract.totalStaked(),
+          addr ? provider.getBalance(addr) : Promise.resolve(0n),
+        ];
+        if (addr) queries.push(contract.allowance(addr, CONTRACT_ADDRESS));
 
-      const results = await Promise.allSettled(queries);
-      const [ts, tpm, bal, staked, rewards, totalS, maticBal, allowanceData] = results;
+        const results = await Promise.allSettled(queries);
+        const [ts, tpm, bal, staked, rewards, totalS, maticBal, allowanceData] = results;
 
-      if (ts.status === 'fulfilled') setTotalSupply(fmt(ts.value));
-      if (tpm.status === 'fulfilled') setTokensPerMatic(tpm.value);
-      if (bal.status === 'fulfilled') setWlthBalance(fmt(bal.value));
-      if (staked.status === 'fulfilled') setStakedBal(fmt(staked.value));
-      if (rewards.status === 'fulfilled') setPendingRew(fmt(rewards.value));
-      if (totalS.status === 'fulfilled') setTotalStaked(fmt(totalS.value));
-      if (maticBal.status === 'fulfilled') setMaticBalance(ethers.formatEther(maticBal.value));
-      if (allowanceData && allowanceData.status === 'fulfilled') setAllowance(allowanceData.value.toString());
-    } catch (e) {
-      console.warn('Contract read error:', e);
+        // Log any individual call failures to help diagnose issues
+        results.forEach((r, i) => {
+          if (r.status === 'rejected') console.warn(`Contract query[${i}] failed (${rpcUrl}):`, r.reason);
+        });
+
+        if (ts.status === 'fulfilled') setTotalSupply(fmt(ts.value));
+        if (tpm.status === 'fulfilled') setTokensPerMatic(tpm.value);
+        if (bal.status === 'fulfilled') { console.log('WTC balance raw:', bal.value.toString()); setWlthBalance(fmt(bal.value)); }
+        if (staked.status === 'fulfilled') setStakedBal(fmt(staked.value));
+        if (rewards.status === 'fulfilled') setPendingRew(fmt(rewards.value));
+        if (totalS.status === 'fulfilled') setTotalStaked(fmt(totalS.value));
+        if (maticBal.status === 'fulfilled') setMaticBalance(ethers.formatEther(maticBal.value));
+        if (allowanceData && allowanceData.status === 'fulfilled') setAllowance(allowanceData.value.toString());
+        return; // success — stop trying more RPCs
+      } catch (e) {
+        console.warn(`RPC ${rpcUrl} failed:`, e);
+        lastError = e;
+      }
     }
+    console.warn('All RPCs failed:', lastError);
   }, []);
 
   const connect = useCallback(async (method = 'injected') => {
