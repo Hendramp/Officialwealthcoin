@@ -1231,26 +1231,46 @@ export default function App() {
     globalThis.setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
   }, []);
 
-  const loadContractData = useCallback(async (addr) => {
-    // If we have a live wallet provider, use it to read POL balance — it's always accurate
-    if (addr && providerRef.current) {
-      try {
-        const walletProvider = new ethers.BrowserProvider(providerRef.current);
-        const polWei = await walletProvider.getBalance(addr);
-        setMaticBalance(ethers.formatEther(polWei));
-        console.log('POL balance from wallet:', ethers.formatEther(polWei));
-        // Also read WTC balance via wallet provider
-        const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, walletProvider);
-        const wtcBal = await contract.balanceOf(addr);
-        console.log('WTC balance from wallet:', wtcBal.toString());
-        setWlthBalance(fmt(wtcBal));
-      } catch (e) {
-        console.warn('Wallet provider balance read failed:', e);
+  // Read balances directly from the wallet provider (always accurate, no RPC needed)
+  const loadWalletBalances = useCallback(async (addr, rawProvider) => {
+    if (!addr || !rawProvider) return;
+    try {
+      const wp = new ethers.BrowserProvider(rawProvider);
+      const [polWei, wtcBal] = await Promise.all([
+        wp.getBalance(addr),
+        new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wp).balanceOf(addr),
+      ]);
+      setMaticBalance(ethers.formatEther(polWei));
+      setWlthBalance(fmt(wtcBal));
+      console.log('Balances from wallet — POL:', ethers.formatEther(polWei), 'WTC:', wtcBal.toString());
+    } catch (e) {
+      console.warn('Wallet balance read failed, trying RPC fallback:', e);
+      // Fallback: read from RPC
+      for (const rpcUrl of POLYGON_RPC_URLS) {
+        try {
+          const rpc = new ethers.JsonRpcProvider(rpcUrl);
+          const [polWei, wtcBal] = await Promise.all([
+            rpc.getBalance(addr),
+            new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, rpc).balanceOf(addr),
+          ]);
+          setMaticBalance(ethers.formatEther(polWei));
+          setWlthBalance(fmt(wtcBal));
+          console.log('Balances from RPC — POL:', ethers.formatEther(polWei), 'WTC:', wtcBal.toString());
+          return;
+        } catch (rpcErr) {
+          console.warn(`RPC ${rpcUrl} balance fallback failed:`, rpcErr);
+        }
       }
     }
+  }, []);
 
-    // Try each RPC in order for contract/staking data
-    let lastError;
+  const loadContractData = useCallback(async (addr) => {
+    // Load wallet balances separately (fast, direct from wallet)
+    if (addr && providerRef.current) {
+      loadWalletBalances(addr, providerRef.current);
+    }
+
+    // Load contract/staking data from RPC
     for (const rpcUrl of POLYGON_RPC_URLS) {
       try {
         const provider = new ethers.JsonRpcProvider(rpcUrl);
@@ -1259,14 +1279,14 @@ export default function App() {
         const queries = [
           contract.totalSupply(),
           contract.tokensPerMatic(),
+          contract.totalStaked(),
           addr ? contract.stakedBalance(addr) : Promise.resolve(0n),
           addr ? contract.pendingRewards(addr) : Promise.resolve(0n),
-          contract.totalStaked(),
           addr ? contract.allowance(addr, CONTRACT_ADDRESS) : Promise.resolve(0n),
         ];
 
         const results = await Promise.allSettled(queries);
-        const [ts, tpm, staked, rewards, totalS, allowanceData] = results;
+        const [ts, tpm, totalS, staked, rewards, allowanceData] = results;
 
         results.forEach((r, i) => {
           if (r.status === 'rejected') console.warn(`RPC query[${i}] failed (${rpcUrl}):`, r.reason);
@@ -1283,11 +1303,9 @@ export default function App() {
         return;
       } catch (e) {
         console.warn(`RPC ${rpcUrl} failed:`, e);
-        lastError = e;
       }
     }
-    console.warn('All RPCs failed:', lastError);
-  }, []);
+  }, [loadWalletBalances]);
 
   const connect = useCallback(async (method = 'injected') => {
     setConnectingMethod(method);
@@ -1299,8 +1317,6 @@ export default function App() {
         walletConnectProviderRef.current = preferredProvider;
         providerRef.current = preferredProvider;
         await preferredProvider.connect();
-        // After WalletConnect .connect() the session is established;
-        // accounts and chainId are already populated on the provider.
         const wcAccounts = preferredProvider.accounts ?? [];
         if (!wcAccounts.length) {
           addToast('No wallet account was selected.', 'error');
@@ -1310,7 +1326,9 @@ export default function App() {
         setAccount(wcAccounts[0]);
         setChainId(typeof wcChainId === 'string' ? parseInt(wcChainId, 16) : wcChainId);
         setConnectModalOpen(false);
-        await loadContractData(wcAccounts[0]);
+        // providerRef.current is set — load balances directly from wallet then contract data
+        await loadWalletBalances(wcAccounts[0], preferredProvider);
+        loadContractData(wcAccounts[0]);
         return;
       } else {
         preferredProvider = getPreferredProvider();
@@ -1321,6 +1339,7 @@ export default function App() {
         return;
       }
 
+      // Set providerRef BEFORE loading data so loadWalletBalances can use it
       providerRef.current = preferredProvider;
       const accounts = await preferredProvider.request({ method: 'eth_requestAccounts' });
       if (!accounts?.length) {
@@ -1332,7 +1351,9 @@ export default function App() {
       setAccount(accounts[0]);
       setChainId(parseInt(chainHex, 16));
       setConnectModalOpen(false);
-      await loadContractData(accounts[0]);
+      // Load wallet balances immediately (fast), then contract data in background
+      await loadWalletBalances(accounts[0], preferredProvider);
+      loadContractData(accounts[0]);
     } catch (e) {
       if (e?.code === 4001) {
         addToast('Connection request was rejected.', 'error');
@@ -1342,7 +1363,7 @@ export default function App() {
     } finally {
       setConnectingMethod(null);
     }
-  }, [addToast, loadContractData]);
+  }, [addToast, loadContractData, loadWalletBalances]);
 
   const disconnect = useCallback(async () => {
     try {
@@ -1427,6 +1448,8 @@ export default function App() {
           setAccount(accounts[0]);
           const chainHex = await preferredProvider.request({ method: 'eth_chainId' });
           setChainId(parseInt(chainHex, 16));
+          // Load balances from wallet directly first (fast), then RPC data
+          await loadWalletBalances(accounts[0], preferredProvider);
           loadContractData(accounts[0]);
         }
       } catch (e) {
@@ -1445,14 +1468,17 @@ export default function App() {
     return () => {
       cleanupPromise?.then(cleanup => cleanup?.());
     };
-  }, [disconnect, loadContractData]);
+  }, [disconnect, loadContractData, loadWalletBalances]);
 
   // Auto-refresh balances every 30s while a wallet is connected
   useEffect(() => {
     if (!account) return;
-    const interval = setInterval(() => loadContractData(account), 30_000);
+    const interval = setInterval(() => {
+      if (providerRef.current) loadWalletBalances(account, providerRef.current);
+      loadContractData(account);
+    }, 30_000);
     return () => clearInterval(interval);
-  }, [account, loadContractData]);
+  }, [account, loadContractData, loadWalletBalances]);
 
   return (
     <div className="min-h-screen bg-[#0A0A0A]">
